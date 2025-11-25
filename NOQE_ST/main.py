@@ -444,6 +444,13 @@ def example_h2_molecule():
     print(f"H_11: Shadow = {H_shadow[1,1].real:.4f}, Exact = {H_exact[1,1].real:.4f}, Error = {abs(H_shadow[1,1] - H_exact[1,1]):.4f}")
     print(f"H_01: Shadow = {H_shadow[0,1].real:.4f}, Exact = {H_exact[0,1].real:.4f}, Error = {abs(H_shadow[0,1] - H_exact[0,1]):.4f}")
 
+    # Test hybrid: shadow S with exact H
+    print("\n--- Hybrid test: Shadow S + Exact H ---")
+    H_hybrid = H_exact.copy()
+    S_hybrid = S_shadow.copy()
+    energies_hybrid, _ = noqe.solve_eigenproblem(H_hybrid, S_hybrid)
+    print(f"Hybrid ground state: {energies_hybrid[0].real:.6f} Ha")
+
     # Solve with shadow matrices
     print("\n--- Shadow-based eigenvalue solution ---")
     energies_shadow, _ = noqe.solve_eigenproblem(H_shadow, S_shadow)
