@@ -55,7 +55,6 @@ from matrix_estimation import MatrixElementEstimator
 
 
 # Shadow tomography configuration
-NUM_SHADOWS = 1000  # Number of classical shadows per state
 NUM_WORKERS = mp.cpu_count()  # Use all available CPUs
 
 
@@ -257,9 +256,12 @@ def _estimate_offdiag_worker(args):
 
 
 def main():
+
     # load Q-SENSE basis states
     molecule        = sys.argv[1]
     bond_length     = float(sys.argv[2])
+    NUM_SHADOWS  = int(sys.argv[3])   
+
     filename        = f'{molecule}_data/Uext_CSF_for_Praveen_Smik_{bond_length}.dump'
     output_filename = f'main_outputs/{molecule}_{bond_length}_PT_serial'
 

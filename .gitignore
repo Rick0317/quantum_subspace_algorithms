@@ -1,3 +1,4 @@
 *.pyc
 H2O*
 __pycache__/
+*.sh
