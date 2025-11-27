@@ -142,32 +142,39 @@ class MatrixElementEstimator:
             # Use linear estimation which is exact for expectation values
             return complex(self.estimator.estimate_linear(shadows_i, hamiltonian), 0)
 
-        # Off-diagonal estimation for <ψ_i|H|ψ_j>
-        # For orthogonal states, we can't use the bilinear form Tr(ρ_i H ρ_j)
-        # because it gives <ψ_i|H|ψ_j> * <ψ_j|ψ_i> = 0.
+        # Off-diagonal estimation for H_ij = <ψ_i|H|ψ_j>
         #
-        # Instead, we use: <ψ_i|H|ψ_j> = Tr(|ψ_j><ψ_i| H)
-        # This can be estimated as Tr(ρ_j H) projected onto ρ_i direction
+        # From the paper, the key relation is:
+        #   H_ij · S_ij = Tr(ρ_j ρ_i H)
         #
-        # For pure states with shadows, we estimate the real part via:
-        # Re(<ψ_i|H|ψ_j>) ≈ (1/2) * Tr((ρ_i + ρ_j) H (ρ_i + ρ_j)) - (1/2)*(H_ii + H_jj)
-        # But this requires superposition shadows.
+        # Proof for pure states ρ_i = |ψ_i><ψ_i|, ρ_j = |ψ_j><ψ_j|:
+        #   Tr(ρ_j ρ_i H) = Tr(|ψ_j><ψ_j|ψ_i><ψ_i| H)
+        #                 = <ψ_j|ψ_i> · Tr(|ψ_j><ψ_i| H)
+        #                 = <ψ_j|ψ_i> · <ψ_i|H|ψ_j>
+        #                 = S_ji · H_ij
         #
-        # Simpler approximation: use the bilinear form directly
-        # Tr(ρ_i H ρ_j) gives <ψ_i|H|ψ_j><ψ_j|ψ_i> for pure states
+        # Therefore: H_ij = Tr(ρ_j ρ_i H) / S_ji = Tr(ρ_j ρ_i H) / conj(S_ij)
+        #
+        # The estimate_bilinear function computes Tr(ρ_a O ρ_b) for inputs (shadows_a, shadows_b, O).
+        # We need Tr(ρ_j ρ_i H). Using cyclic property of trace:
+        #   Tr(ρ_j ρ_i H) = Tr(H ρ_j ρ_i) = Tr(ρ_i H ρ_j)
+        #
+        # So estimate_bilinear(shadows_i, shadows_j, H) = Tr(ρ_i H ρ_j) = Tr(ρ_j ρ_i H)
+        #
+        # This gives us: H_ij · S_ji = Tr(ρ_j ρ_i H)
+        # Therefore: H_ij = Tr(ρ_j ρ_i H) / S_ji = Tr(ρ_i H ρ_j) / conj(S_ij)
+
         hij_times_sji = self.estimator.estimate_bilinear(shadows_i, shadows_j, hamiltonian)
 
-        # For orthogonal states (S_ij ≈ 0), the off-diagonal H_ij should come
-        # from the exchange terms in H that connect |ψ_i> and |ψ_j>
-        # Return the bilinear estimate directly as an approximation
+        # For orthogonal states (S_ij ≈ 0), the bilinear form gives ~0
+        # Cannot extract H_ij by division; return raw estimate
         if abs(overlap_ij) < 1e-6:
-            # For orthogonal states, bilinear gives ~0, but exchange terms exist
-            # Use a symmetrized estimate: average of both orderings
-            hji_times_sij = self.estimator.estimate_bilinear(shadows_j, shadows_i, hamiltonian)
-            return complex((hij_times_sji + hji_times_sij) / 2, 0)
+            return complex(hij_times_sji, 0)
 
-        # For non-orthogonal states: H_ij = Tr(ρ_i H ρ_j) / S_ji
-        return hij_times_sji / np.conj(overlap_ij)
+        # H_ij = Tr(ρ_i H ρ_j) / S_ji = Tr(ρ_i H ρ_j) / conj(S_ij)
+        h_ij = hij_times_sji / np.conj(overlap_ij)
+
+        return h_ij
 
 
 class NOQEMatrixBuilder:
@@ -201,7 +208,7 @@ class NOQEMatrixBuilder:
         self.auxiliary_R_shadows[ref_idx] = aux_R_shadows
         self.auxiliary_I_shadows[ref_idx] = aux_I_shadows
 
-    def build_overlap_matrix(self, use_simple_estimation: bool = True) -> np.ndarray:
+    def build_overlap_matrix(self, use_simple_estimation: bool = False) -> np.ndarray:
         """
         Build complete overlap matrix S
 

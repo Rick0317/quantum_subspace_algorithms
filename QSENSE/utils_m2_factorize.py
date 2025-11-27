@@ -396,6 +396,51 @@ def partially_evaluate_hamiltonian_matrix_element(psi, phi, H, C):
         H_evaluated += coef * partially_evaluate_pauli_term(psi, phi, term, C)
     return H_evaluated
 
+def extract_quantum_states(factorization_dict_bra, factorization_dict_ket, bra_labels, ket_labels):
+    """
+    Extract only the quantum state parts without processing the Hamiltonian.
+
+    This is useful for shadow tomography where we need to identify unique quantum
+    states before collecting shadows, but don't need the Hamiltonian processing
+    until the estimation phase.
+
+    Args:
+        factorization_dict_bra: Factorized bra state
+        factorization_dict_ket: Factorized ket state
+        bra_labels: Labels for bra state orbitals ('W', 'V', 'N')
+        ket_labels: Labels for ket state orbitals ('W', 'V', 'N')
+
+    Returns:
+        Tuple of (Qstate_bra, Qstate_ket, NqubitsQ, full_Q_block)
+        - Qstate_bra: Quantum part of bra state (numpy array), empty if NQ=0
+        - Qstate_ket: Quantum part of ket state (numpy array), empty if NQ=0
+        - NqubitsQ: Number of quantum qubits
+        - full_Q_block: Sorted tuple of quantum qubit indices (for Hamiltonian relabeling)
+    """
+    join_partition, coarse_dict_bra, coarse_dict_ket = obtain_coarse_dicts(factorization_dict_bra, factorization_dict_ket)
+    QC_assignment_dict = QC_assignment_from_qubit_labels(bra_labels, ket_labels, join_partition)
+
+    full_Q_block = set()
+    for block, assignment in QC_assignment_dict.items():
+        if assignment == 'C':
+            # Remove classical blocks - we don't need them for state extraction
+            del coarse_dict_bra[block]
+            del coarse_dict_ket[block]
+        else:
+            full_Q_block.update(block)
+
+    if coarse_dict_bra == dict():
+        assert coarse_dict_ket == dict()
+        return np.array([]), np.array([]), 0, tuple()
+
+    full_Q_block = tuple(sorted(full_Q_block))
+    Qstate_bra = expand_tensor_product_for_incomplete_qubit_set(coarse_dict_bra)
+    Qstate_ket = expand_tensor_product_for_incomplete_qubit_set(coarse_dict_ket)
+    NqubitsQ = int(log(len(Qstate_bra), 2))
+
+    return Qstate_bra, Qstate_ket, NqubitsQ, full_Q_block
+
+
 def evaluate_fully_classical_factors(factorization_dict_bra, factorization_dict_ket, bra_labels, ket_labels, H):
 
     join_partition, coarse_dict_bra, coarse_dict_ket = obtain_coarse_dicts(factorization_dict_bra, factorization_dict_ket)
@@ -415,7 +460,7 @@ def evaluate_fully_classical_factors(factorization_dict_bra, factorization_dict_
         assert coarse_dict_ket == dict()
         return H, np.array([]), np.array([]), 0
 
-    full_Q_block = sorted(tuple(full_Q_block))            
+    full_Q_block = sorted(tuple(full_Q_block))
     Heff         = QubitOperator()
     for term, coef in H.terms.items():
         Heff += coef * QubitOperator(relabel_qubits_in_pauli_term(term, full_Q_block))

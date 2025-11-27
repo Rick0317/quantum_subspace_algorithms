@@ -395,7 +395,7 @@ def example_h2_molecule():
     noqe = ShadowNOQE(
         num_qubits=num_qubits,
         num_references=num_references,
-        num_shadows=10000,
+        num_shadows=5000,
         use_error_mitigation=False,  # Disable for now - distillation may add overhead
         mitigation_order=3,
         verbose=True

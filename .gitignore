@@ -1,0 +1,3 @@
+*.pyc
+H2O*
+__pycache__/
