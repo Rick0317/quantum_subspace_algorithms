@@ -6,4 +6,4 @@
 
 module load python/3.10
 
-python main_sampling_cost_PT_parallel.py ${1} ${2}
+python main_sampling_cost_PT_parallel_killer.py ${1} ${2}

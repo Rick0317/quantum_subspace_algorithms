@@ -416,6 +416,13 @@ def main():
     print(f"  Found {len(unique_state_pairs)} unique quantum state pairs for off-diagonal elements")
     print(f"  Total matrix elements: {len(precomputed_data)}")
 
+    for state in unique_states:
+        # Number of qubits for this reference state
+        num_qubits = ...
+
+        # 
+
+
     # =============================================================================
     # PHASE 2: Collect shadows for all unique quantum states (PARALLEL)
     # =============================================================================
@@ -510,18 +517,121 @@ def main():
 
     print(f"    Completed {total_pairs} off-diagonal estimations in {elapsed:.1f}s")
 
+    # =============================================================================
+    # PHASE 4: Compute EXACT matrix elements for comparison
+    # =============================================================================
+    print("\nPhase 4: Computing exact matrix elements for comparison...")
+
+    Hsub_exact = np.zeros([Nstates, Nstates], dtype=np.complex128)
+
+    # Exact diagonal elements
+    for i in range(Nstates):
+        ket_f = factorized_tapered_statevectors[i]
+        ket_labels = UCSF_information[i][0]
+        ket_config = configs[i]
+
+        Htapered = project_out_seniority_symmetries(Hqub, Nqubits, ket_config, ket_config)
+        HQ, ketQ, _, NQ = evaluate_fully_classical_factors(ket_f, ket_f, ket_labels, ket_labels, Htapered)
+
+        if NQ == 0:
+            Hsub_exact[i, i] = HQ.constant
+        else:
+            HQsparse = get_sparse_operator(HQ)
+            ketQ_sparse = convert_dense_format_to_sparse_format(ketQ)
+            Hsub_exact[i, i] = (ketQ_sparse @ HQsparse @ ketQ_sparse.T)[0, 0]
+
+    # Exact off-diagonal elements
+    for i in range(Nstates):
+        for j in range(Nstates):
+            if i > j:
+                ij_shift = 0.5 * (Hsub_exact[i, i] + Hsub_exact[j, j])
+
+                bra_f = factorized_tapered_statevectors[i]
+                bra_labels = UCSF_information[i][0]
+                bra_config = configs[i]
+
+                ket_f = factorized_tapered_statevectors[j]
+                ket_labels = UCSF_information[j][0]
+                ket_config = configs[j]
+
+                Htapered = project_out_seniority_symmetries(Hqub - ij_shift, Nqubits, bra_config, ket_config)
+                HQ, braQ, ketQ, NQ = evaluate_fully_classical_factors(bra_f, ket_f, bra_labels, ket_labels, Htapered)
+
+                if NQ == 0:
+                    Hsub_exact[i, j] = HQ.constant
+                else:
+                    HQsparse = get_sparse_operator(HQ, NQ)
+                    braQ_sparse = convert_dense_format_to_sparse_format(braQ)
+                    ketQ_sparse = convert_dense_format_to_sparse_format(ketQ)
+                    Hsub_exact[i, j] = (braQ_sparse @ HQsparse @ ketQ_sparse.T)[0, 0]
+
+                Hsub_exact[j, i] = Hsub_exact[i, j]
+
+    # Compute exact ground state energy
+    vals_exact, vecs_exact = np.linalg.eigh(Hsub_exact)
+    Egs_exact = vals_exact[0]
+
+    # Compute shadow tomography results
     vals, vecs = np.linalg.eigh(Hsub)
     Egs        = vals[0]
     c          = vecs[:,0]
     cost       = sampling_cost(c, sig_matrix)
 
+    # =============================================================================
+    # Output: Matrix element comparison
+    # =============================================================================
     with open(output_filename, 'a') as f:
+        print(f"\n{'='*70}", file=f)
+        print(f"Matrix Element Comparison: Shadow Tomography vs Exact", file=f)
+        print(f"{'='*70}", file=f)
+        print(f"Molecule: {molecule}, Bond Length: {bond_length}, Num Shadows: {NUM_SHADOWS}", file=f)
+        print(f"\n--- Diagonal Elements ---", file=f)
+        print(f"{'(i,i)':<10} {'ST Estimate':>15} {'Exact':>15} {'Error':>15} {'Rel Error %':>12}", file=f)
+        print(f"{'-'*10} {'-'*15} {'-'*15} {'-'*15} {'-'*12}", file=f)
+
+        for i in range(Nstates):
+            st_val = Hsub[i, i].real
+            exact_val = Hsub_exact[i, i].real
+            error = abs(st_val - exact_val)
+            rel_error = 100 * error / abs(exact_val) if abs(exact_val) > 1e-10 else 0
+            print(f"({i},{i})      {st_val:>15.8f} {exact_val:>15.8f} {error:>15.8f} {rel_error:>11.2f}%", file=f)
+
+        print(f"\n--- Off-Diagonal Elements ---", file=f)
+        print(f"{'(i,j)':<10} {'ST Estimate':>15} {'Exact':>15} {'Error':>15} {'Rel Error %':>12}", file=f)
+        print(f"{'-'*10} {'-'*15} {'-'*15} {'-'*15} {'-'*12}", file=f)
+
+        for i in range(Nstates):
+            for j in range(Nstates):
+                if i > j:
+                    st_val = Hsub[i, j].real
+                    exact_val = Hsub_exact[i, j].real
+                    error = abs(st_val - exact_val)
+                    rel_error = 100 * error / abs(exact_val) if abs(exact_val) > 1e-10 else 0
+                    print(f"({i},{j})      {st_val:>15.8f} {exact_val:>15.8f} {error:>15.8f} {rel_error:>11.2f}%", file=f)
+
+        print(f"\n--- Summary Statistics ---", file=f)
+        # Compute overall errors
+        diag_errors = [abs(Hsub[i,i].real - Hsub_exact[i,i].real) for i in range(Nstates)]
+        offdiag_errors = [abs(Hsub[i,j].real - Hsub_exact[i,j].real)
+                         for i in range(Nstates) for j in range(Nstates) if i > j]
+
+        print(f"Diagonal elements:     mean error = {np.mean(diag_errors):.8f}, max error = {np.max(diag_errors):.8f}", file=f)
+        if offdiag_errors:
+            print(f"Off-diagonal elements: mean error = {np.mean(offdiag_errors):.8f}, max error = {np.max(offdiag_errors):.8f}", file=f)
+
+        print(f"\n--- Energy Comparison ---", file=f)
+        print(f"Exact Ground State Energy:  {Egs_exact:.10f}", file=f)
+        print(f"Shadow Tomography Energy:   {Egs:.10f}", file=f)
+        print(f"Energy Error:               {abs(Egs - Egs_exact):.10f}", file=f)
+
         print(f'''
         Final Results:
             Method              : PT + Shadow Tomography
             Molecule            : {molecule}
             Bond Length         : {bond_length}
             Ground State Energy : {Egs}
+            Exact Energy        : {Egs_exact}
+            Energy Error        : {abs(Egs - Egs_exact)}
             Sampling Cost       : {cost}
             Num Shadows/State   : {NUM_SHADOWS}
         ''', file=f)
