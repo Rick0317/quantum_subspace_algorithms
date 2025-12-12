@@ -111,9 +111,9 @@ def simulate_shadow_collection(state_vector: np.ndarray, num_shadows: int) -> li
         num_shadows: Number of shadows to collect
 
     Returns:
-        List of (U, outcome) tuples where U is the Clifford unitary and outcome
-        is the measurement result (integer index of computational basis state).
-        This compact representation saves memory vs storing full shadow matrices.
+        List of (Clifford, outcome) tuples where Clifford is stored in compact
+        tableau form O(n²) and outcome is the measurement result (integer).
+        This saves memory vs storing full 2^n × 2^n unitary matrices.
     """
 
     # Ensure state_vector is 1D
@@ -133,8 +133,9 @@ def simulate_shadow_collection(state_vector: np.ndarray, num_shadows: int) -> li
 
     shadows = []
     for _ in range(num_shadows):
-        # Generate random Clifford 2^N x 2^N
+        # Generate random Clifford - stored in compact tableau form O(n²)
         cliff = random_clifford(num_qubits)
+        # Convert to unitary only for simulation (not stored)
         U = Operator(cliff).data
 
         # Apply Clifford to state: U|ψ⟩
@@ -146,24 +147,27 @@ def simulate_shadow_collection(state_vector: np.ndarray, num_shadows: int) -> li
         # Sample measurement outcome (computational basis)
         outcome = np.random.choice(dim, p=probs)
 
-        # Store compact representation: (U, outcome)
+        # Store compact representation: (Clifford tableau, outcome)
+        # Clifford tableau is O(n²) vs O(4^n) for full unitary matrix
         # Shadow can be reconstructed as: ρ̂ = (2^n + 1)(U†|b⟩⟨b|U) - I
-        shadows.append((U, outcome))
+        shadows.append((cliff, outcome))
 
     return shadows
 
 
-def reconstruct_shadow(U: np.ndarray, outcome: int) -> np.ndarray:
+def reconstruct_shadow(cliff, outcome: int) -> np.ndarray:
     """
-    Reconstruct a classical shadow density matrix from (U, outcome) tuple.
+    Reconstruct a classical shadow density matrix from (Clifford, outcome) tuple.
 
     Args:
-        U: Clifford unitary matrix
+        cliff: Qiskit Clifford object (compact tableau representation)
         outcome: Measurement outcome (integer index)
 
     Returns:
         Shadow density matrix ρ̂ = (2^n + 1)(U†|b⟩⟨b|U) - I
     """
+    # Convert Clifford tableau to full unitary matrix
+    U = Operator(cliff).data
     dim = U.shape[0]
 
     # Construct |b⟩⟨b|
@@ -181,15 +185,15 @@ def reconstruct_shadow(U: np.ndarray, outcome: int) -> np.ndarray:
 
 def reconstruct_shadows(compact_shadows: list) -> list:
     """
-    Reconstruct full shadow matrices from compact (U, outcome) representation.
+    Reconstruct full shadow matrices from compact (Clifford, outcome) representation.
 
     Args:
-        compact_shadows: List of (U, outcome) tuples
+        compact_shadows: List of (Clifford, outcome) tuples
 
     Returns:
         List of full shadow density matrices
     """
-    return [reconstruct_shadow(U, outcome) for U, outcome in compact_shadows]
+    return [reconstruct_shadow(cliff, outcome) for cliff, outcome in compact_shadows]
 
 
 def shadow_sampling_cost_diagonal(NQ: int, num_shadows: int) -> float:
