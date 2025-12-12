@@ -135,7 +135,7 @@ for i in range(Nstates):
 
         HQ              -= HQ.constant
         HQ.compress()
-        decomp = sorted_insertion_decomposition(HQ, 'fc')
+        decomp = sorted_insertion_decomposition(HQ, 'qwc')
         var_metric       = variance_of_decomp(decomp, ketQ, NQ, general=True)
         sig_matrix[i,i] = np.sqrt(var_metric)
 
@@ -168,7 +168,7 @@ def evaluate_off_diagonal(i, j, Hsub, factorized_tapered_statevectors, UCSF_info
 
         comp             = create_composite_state(braQ, ketQ, NQ)
         HQ_aug           = XorY_augment(HQ, NQ)
-        decomp           = sorted_insertion_decomposition(HQ_aug, 'fc')
+        decomp           = sorted_insertion_decomposition(HQ_aug, 'qwc')
         var_metric       = variance_of_decomp(decomp, comp, NQ + 1, general=True)
         element_variance = np.sqrt(var_metric)
 

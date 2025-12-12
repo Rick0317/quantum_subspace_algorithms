@@ -47,11 +47,13 @@ import pickle
 import sys
 import os
 import multiprocessing as mp
+from qiskit.quantum_info import random_clifford, Operator
+import time
+from datetime import datetime
 
 # Add NOQE_ST to path for shadow tomography imports
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'NOQE_ST'))
 from shadow_tomography import ShadowEstimator
-from matrix_estimation import MatrixElementEstimator
 
 
 # Shadow tomography configuration
@@ -109,9 +111,10 @@ def simulate_shadow_collection(state_vector: np.ndarray, num_shadows: int) -> li
         num_shadows: Number of shadows to collect
 
     Returns:
-        List of classical shadow density matrices
+        List of (U, outcome) tuples where U is the Clifford unitary and outcome
+        is the measurement result (integer index of computational basis state).
+        This compact representation saves memory vs storing full shadow matrices.
     """
-    from qiskit.quantum_info import random_clifford, Operator
 
     # Ensure state_vector is 1D
     if hasattr(state_vector, 'toarray'):
@@ -122,12 +125,15 @@ def simulate_shadow_collection(state_vector: np.ndarray, num_shadows: int) -> li
     dim = len(state_vector)
     num_qubits = int(np.log2(dim))
 
-    # True density matrix
-    rho_true = np.outer(state_vector, np.conj(state_vector))
+    # IMPORTANT: Normalize state vector for correct probability sampling
+    # The quantum states from Q-SENSE factorization may not be normalized
+    norm = np.linalg.norm(state_vector)
+    if norm > 1e-10:
+        state_vector = state_vector / norm
 
     shadows = []
     for _ in range(num_shadows):
-        # Generate random Clifford
+        # Generate random Clifford 2^N x 2^N
         cliff = random_clifford(num_qubits)
         U = Operator(cliff).data
 
@@ -137,22 +143,53 @@ def simulate_shadow_collection(state_vector: np.ndarray, num_shadows: int) -> li
         # Compute measurement probabilities
         probs = np.abs(rotated_state) ** 2
 
-        # Sample measurement outcome
+        # Sample measurement outcome (computational basis)
         outcome = np.random.choice(dim, p=probs)
 
-        # Construct |b⟩⟨b|
-        b_state = np.zeros(dim)
-        b_state[outcome] = 1.0
-        rho_b = np.outer(b_state, b_state)
-
-        # Apply inverse channel: ρ̂ = (2^n + 1)(U†|b⟩⟨b|U) - I
-        U_dag = U.conj().T
-        sigma = U_dag @ rho_b @ U
-        rho_hat = (dim + 1) * sigma - np.eye(dim)
-
-        shadows.append(rho_hat)
+        # Store compact representation: (U, outcome)
+        # Shadow can be reconstructed as: ρ̂ = (2^n + 1)(U†|b⟩⟨b|U) - I
+        shadows.append((U, outcome))
 
     return shadows
+
+
+def reconstruct_shadow(U: np.ndarray, outcome: int) -> np.ndarray:
+    """
+    Reconstruct a classical shadow density matrix from (U, outcome) tuple.
+
+    Args:
+        U: Clifford unitary matrix
+        outcome: Measurement outcome (integer index)
+
+    Returns:
+        Shadow density matrix ρ̂ = (2^n + 1)(U†|b⟩⟨b|U) - I
+    """
+    dim = U.shape[0]
+
+    # Construct |b⟩⟨b|
+    b_state = np.zeros(dim)
+    b_state[outcome] = 1.0
+    rho_b = np.outer(b_state, b_state)
+
+    # Apply inverse channel: ρ̂ = (2^n + 1)(U†|b⟩⟨b|U) - I
+    U_dag = U.conj().T
+    sigma = U_dag @ rho_b @ U
+    rho_hat = (dim + 1) * sigma - np.eye(dim)
+
+    return rho_hat
+
+
+def reconstruct_shadows(compact_shadows: list) -> list:
+    """
+    Reconstruct full shadow matrices from compact (U, outcome) representation.
+
+    Args:
+        compact_shadows: List of (U, outcome) tuples
+
+    Returns:
+        List of full shadow density matrices
+    """
+    return [reconstruct_shadow(U, outcome) for U, outcome in compact_shadows]
 
 
 def shadow_sampling_cost_diagonal(NQ: int, num_shadows: int) -> float:
@@ -212,45 +249,90 @@ def _collect_shadows_worker(args):
     return state_idx, shadows
 
 
-def _estimate_offdiag_worker(args):
-    """Worker function for off-diagonal matrix element estimation (full pipeline)."""
-    (i, j, bra_f, ket_f, bra_labels, ket_labels, bra_config, ket_config,
-     Hqub, Nqubits, shadows_by_idx, precomputed_data, num_shadows) = args
-    print(f"    Estimating off-diagonal element ({i}, {j})...")
-    # Step 1: Taper Hamiltonian and evaluate classical factors
-    Htapered = project_out_seniority_symmetries(Hqub, Nqubits, bra_config, ket_config)
-    HQ, _, _, NQ = evaluate_fully_classical_factors(bra_f, ket_f, bra_labels, ket_labels, Htapered)
+def _estimate_diag_worker(args):
+    """Worker function for diagonal matrix element estimation (parallel)."""
+    (i, ket_f, ket_labels, ket_config, Hqub, Nqubits,
+     shadows_by_idx, precomputed_data, num_shadows, HQ_cache) = args
+
+    # Use precomputed HQ if available, otherwise compute
+    if (i, i) in HQ_cache:
+        HQ, NQ = HQ_cache[(i, i)]
+    else:
+        Htapered = project_out_seniority_symmetries(Hqub, Nqubits, ket_config, ket_config)
+        HQ, _, _, NQ = evaluate_fully_classical_factors(ket_f, ket_f, ket_labels, ket_labels, Htapered)
+
+    if NQ == 0:
+        return i, HQ.constant, 0.0
+
+    data = precomputed_data[(i, i)]
+    compact_shadows_i = shadows_by_idx[data['ketQ_idx']]
+    # Reconstruct full shadow matrices from compact (U, outcome) format
+    shadows_i = reconstruct_shadows(compact_shadows_i)
+    HQsparse = get_sparse_operator(HQ)
+    HQ_dense = HQsparse.toarray()
+
+    estimator = ShadowEstimator()
+    h_ii = estimator.estimate_linear(shadows_i, HQ_dense)
+    sig_ii = shadow_sampling_cost_diagonal(NQ, num_shadows)
+
+    return i, h_ii, sig_ii
+
+
+def _estimate_offdiag_worker_zero_superposition(args):
+    """Worker function for off-diagonal matrix element estimation using |0⟩±|ψ⟩ superpositions.
+
+    Uses the formula:
+        H_ij = 2 * (Tr(ρ_i^+ ρ_j^+ H) + Tr(ρ_i^- ρ_j^- H))
+
+    Where:
+        ρ_i^+ = |+_i⟩⟨+_i| with |+_i⟩ = (|0⟩ + |ψ_i⟩)/√2
+        ρ_i^- = |−_i⟩⟨−_i| with |−_i⟩ = (|0⟩ - |ψ_i⟩)/√2
+
+    This uses bilinear shadow estimation on the ± superposition states.
+    """
+    (i, j, shadows_plus_by_idx, shadows_minus_by_idx, precomputed_data, num_shadows, HQ_cache) = args
+
+    # Use precomputed HQ from cache
+    HQ, NQ = HQ_cache[(i, j)]
 
     if NQ == 0:
         # Purely classical - no quantum estimation needed
         return i, j, HQ.constant, 0.0
 
-    # Step 2: Get shadows and prepare Hamiltonian matrix
+    # Get precomputed data
     data = precomputed_data[(i, j)]
-    shadows_bra = shadows_by_idx[data['braQ_idx']]
-    shadows_ket = shadows_by_idx[data['ketQ_idx']]
+    braQ_idx = data['braQ_idx']
+    ketQ_idx = data['ketQ_idx']
+
+    # Get compact shadows and reconstruct for the |0⟩±|ψ⟩ superposition states
+    shadows_bra_plus = reconstruct_shadows(shadows_plus_by_idx[braQ_idx])    # (|0⟩ + |braQ⟩)/√2
+    shadows_bra_minus = reconstruct_shadows(shadows_minus_by_idx[braQ_idx])  # (|0⟩ - |braQ⟩)/√2
+    shadows_ket_plus = reconstruct_shadows(shadows_plus_by_idx[ketQ_idx])    # (|0⟩ + |ketQ⟩)/√2
+    shadows_ket_minus = reconstruct_shadows(shadows_minus_by_idx[ketQ_idx])  # (|0⟩ - |ketQ⟩)/√2
+
     HQsparse = get_sparse_operator(HQ, NQ)
     HQ_dense = HQsparse.toarray()
 
-    # Step 3: Shadow tomography estimation
-    estimator = ShadowEstimator()
+    # Get H_00 = ⟨0|H|0⟩ for the correction term
+    H_00 = HQ_dense[0, 0].real
 
-    # Estimate overlap |S_ij|² = Tr(ρ_i ρ_j)
-    dim_Q = 2 ** NQ
-    identity = np.eye(dim_Q)
-    overlap_mag_sq = estimator.estimate_bilinear(shadows_bra, shadows_ket, identity)
-    overlap_mag_sq = max(0, overlap_mag_sq)
+    # Use bilinear shadow estimation (static method from ShadowEstimator)
+    # Tr(ρ_i^+ ρ_j^+ H) - bilinear estimation with + superposition shadows
+    tr_plus = ShadowEstimator.estimate_bilinear(shadows_bra_plus, shadows_ket_plus, HQ_dense)
 
-    # Estimate H_ij using the paper's formula
-    hij_times_sji = estimator.estimate_bilinear(shadows_bra, shadows_ket, HQ_dense)
+    # Tr(ρ_i^- ρ_j^- H) - bilinear estimation with - superposition shadows
+    tr_minus = ShadowEstimator.estimate_bilinear(shadows_bra_minus, shadows_ket_minus, HQ_dense)
 
-    if overlap_mag_sq > 1e-6:
-        s_ij = np.sqrt(overlap_mag_sq)
-        h_ij = hij_times_sji / s_ij
-    else:
-        h_ij = hij_times_sji
+    # When S_ij = 0 and ⟨0|ψ_i⟩ = ⟨0|ψ_j⟩ = 0:
+    # 2 * (tr_plus + tr_minus) = H_00 + H_ij
+    # Therefore: H_ij = 2 * (tr_plus + tr_minus) - H_00
+    h_ij = 2.0 * (tr_plus + tr_minus) - H_00
 
-    sig_ij = shadow_sampling_cost_offdiagonal(NQ, num_shadows, overlap_mag_sq)
+    # Variance estimate for bilinear estimation
+    # Bilinear variance scales as O(2^(2n) / num_shadows²)
+    dim = 2 ** NQ
+    variance = 4.0 * 2.0 * (dim + 1) ** 4 / (num_shadows ** 2)  # Factor of 4 from the 2* and 2 terms
+    sig_ij = np.sqrt(variance)
 
     return i, j, h_ij, sig_ij
 
@@ -263,7 +345,8 @@ def main():
     NUM_SHADOWS  = int(sys.argv[3])   
 
     filename        = f'{molecule}_data/Uext_CSF_for_Praveen_Smik_{bond_length}.dump'
-    output_filename = f'main_outputs/{molecule}_{bond_length}_PT_serial'
+    timestamp       = datetime.now().strftime('%Y%m%d_%H%M')
+    output_filename = f'main_outputs/{molecule}_{bond_length}_PT_serial_{timestamp}'
 
     with open(filename, 'rb') as f:
         (
@@ -378,6 +461,7 @@ def main():
             }
 
     # Pre-compute off-diagonal elements (state extraction only, no Hamiltonian processing)
+    # For Hadamard test approach, we also create superposition states |+⟩ = (|bra⟩ + |ket⟩)/√2
     for i in range(Nstates):
         for j in range(Nstates):
             if i > j:
@@ -399,8 +483,9 @@ def main():
                         'ket_config': ket_config
                     }
                 else:
-                    braQ_idx, braQ_dense = register_state(braQ)
-                    ketQ_idx, ketQ_dense = register_state(ketQ)
+                    braQ_idx, _ = register_state(braQ)
+                    ketQ_idx, _ = register_state(ketQ)
+
                     precomputed_data[(i, j)] = {
                         'NQ': NQ,
                         'full_Q_block': full_Q_block,
@@ -412,100 +497,155 @@ def main():
                     # Track unique state pairs (order matters for bilinear estimation)
                     unique_state_pairs.add((braQ_idx, ketQ_idx))
 
-    print(f"  Found {len(unique_states)} unique quantum states across all matrix elements")
+    print(f"  Found {len(unique_states)} unique quantum states (including superposition states)")
     print(f"  Found {len(unique_state_pairs)} unique quantum state pairs for off-diagonal elements")
     print(f"  Total matrix elements: {len(precomputed_data)}")
 
-    for state in unique_states:
-        # Number of qubits for this reference state
-        num_qubits = ...
+    # =============================================================================
+    # PHASE 1b: Precompute HQ matrices for all matrix elements
+    # =============================================================================
+    print("\nPhase 1b: Precomputing tapered Hamiltonians and HQ matrices...")
 
-        # 
+    HQ_cache = {}  # Key: (i, j), Value: (HQ, NQ)
 
+    # Precompute for diagonal elements
+    for i in range(Nstates):
+        ket_f = factorized_tapered_statevectors[i]
+        ket_labels = UCSF_information[i][0]
+        ket_config = configs[i]
+
+        Htapered = project_out_seniority_symmetries(Hqub, Nqubits, ket_config, ket_config)
+        HQ, _, _, NQ = evaluate_fully_classical_factors(ket_f, ket_f, ket_labels, ket_labels, Htapered)
+        HQ_cache[(i, i)] = (HQ, NQ)
+
+    # Precompute for off-diagonal elements
+    for i in range(Nstates):
+        for j in range(Nstates):
+            if i > j:
+                bra_f = factorized_tapered_statevectors[i]
+                bra_labels = UCSF_information[i][0]
+                bra_config = configs[i]
+
+                ket_f = factorized_tapered_statevectors[j]
+                ket_labels = UCSF_information[j][0]
+                ket_config = configs[j]
+
+                Htapered = project_out_seniority_symmetries(Hqub, Nqubits, bra_config, ket_config)
+                HQ, _, _, NQ = evaluate_fully_classical_factors(bra_f, ket_f, bra_labels, ket_labels, Htapered)
+                HQ_cache[(i, j)] = (HQ, NQ)
+
+    print(f"  Precomputed {len(HQ_cache)} HQ matrices")
 
     # =============================================================================
     # PHASE 2: Collect shadows for all unique quantum states (PARALLEL)
+    # Also collect shadows for (|0⟩ + |ψ⟩)/√2 and (|0⟩ - |ψ⟩)/√2 superpositions
     # =============================================================================
-    import time
     print(f"\nPhase 2: Collecting {NUM_SHADOWS} shadows for each unique quantum state (parallel)...")
+    print(f"  Also collecting shadows for |0⟩±|ψ⟩ superposition states")
     print(f"  Using {NUM_WORKERS} workers for {next_state_idx} unique states")
 
     # Prepare arguments for parallel processing: list of (state_idx, state_vector, num_shadows)
     shadow_args = [(idx, state_index_to_key[idx][1], NUM_SHADOWS) for idx in range(next_state_idx)]
 
+    # Also prepare superposition states (|0⟩ + |ψ⟩)/√2 and (|0⟩ - |ψ⟩)/√2
+    superposition_args_plus = []
+    superposition_args_minus = []
+    for idx in range(next_state_idx):
+        state_vector = state_index_to_key[idx][1]
+        dim = len(state_vector)
+        # |0⟩ is the computational basis state |00...0⟩
+        zero_state = np.zeros(dim)
+        zero_state[0] = 1.0
+        # Create (|0⟩ + |ψ⟩)/√2 and normalize
+        plus_superposition = (zero_state + state_vector) / np.sqrt(2)
+        plus_superposition = plus_superposition / np.linalg.norm(plus_superposition)
+        # Create (|0⟩ - |ψ⟩)/√2 and normalize
+        minus_superposition = (zero_state - state_vector) / np.sqrt(2)
+        minus_superposition = minus_superposition / np.linalg.norm(minus_superposition)
+
+        superposition_args_plus.append((f"plus_{idx}", plus_superposition, NUM_SHADOWS))
+        superposition_args_minus.append((f"minus_{idx}", minus_superposition, NUM_SHADOWS))
+
+    # Combine all shadow collection tasks
+    all_shadow_args = shadow_args + superposition_args_plus + superposition_args_minus
+    total_states = len(all_shadow_args)
+    print(f"  Total shadow collections: {total_states} ({next_state_idx} original + {next_state_idx} |+⟩ + {next_state_idx} |−⟩)")
+
     # Parallel shadow collection using multiprocessing Pool
     start_time = time.time()
     with mp.Pool(processes=NUM_WORKERS) as pool:
-        results = pool.map(_collect_shadows_worker, shadow_args)
+        results = pool.map(_collect_shadows_worker, all_shadow_args)
     elapsed = time.time() - start_time
 
-    shadows_by_idx = {state_idx: shadows for state_idx, shadows in results}
+    # Separate results into original states and superposition states
+    shadows_by_idx = {}
+    shadows_plus_by_idx = {}
+    shadows_minus_by_idx = {}
+    for state_idx, shadows in results:
+        if isinstance(state_idx, int):
+            shadows_by_idx[state_idx] = shadows
+        elif isinstance(state_idx, str) and state_idx.startswith("plus_"):
+            orig_idx = int(state_idx.split("_")[1])
+            shadows_plus_by_idx[orig_idx] = shadows
+        elif isinstance(state_idx, str) and state_idx.startswith("minus_"):
+            orig_idx = int(state_idx.split("_")[1])
+            shadows_minus_by_idx[orig_idx] = shadows
 
-    print(f"  Completed {next_state_idx} shadow collections in {elapsed:.1f}s ({elapsed/next_state_idx:.2f}s per state avg)")
+    print(f"  Completed {total_states} shadow collections in {elapsed:.1f}s ({elapsed/total_states:.2f}s per state avg)")
 
     # =============================================================================
-    # PHASE 3: Estimate matrix elements using pre-collected shadows
+    # PHASE 3: Estimate matrix elements using pre-collected shadows (PARALLEL)
     # =============================================================================
     print("\nPhase 3: Estimating matrix elements from shadows...")
 
     Hsub = np.zeros([Nstates, Nstates], dtype=np.complex128)
     sig_matrix = np.zeros([Nstates, Nstates], dtype=np.complex128)
-    estimator = ShadowEstimator()
 
-    # Diagonal elements
-    print("  Estimating diagonal elements...")
+    # Diagonal elements (parallel)
+    print("  Estimating diagonal elements (parallel)...")
+    diag_args = []
     for i in range(Nstates):
-        with open(output_filename, 'a') as f:
-            print(f'{i, i}', file=f)
-
-        data = precomputed_data[(i, i)]
         ket_f = factorized_tapered_statevectors[i]
         ket_labels = UCSF_information[i][0]
+        ket_config = configs[i]
 
-        Htapered = project_out_seniority_symmetries(Hqub, Nqubits, data['ket_config'], data['ket_config'])
-        HQ, _, _, NQ = evaluate_fully_classical_factors(ket_f, ket_f, ket_labels, ket_labels, Htapered)
+        diag_args.append((
+            i, ket_f, ket_labels, ket_config, Hqub, Nqubits,
+            shadows_by_idx, precomputed_data, NUM_SHADOWS, HQ_cache
+        ))
 
-        if NQ == 0:
-            Hsub[i, i] = HQ.constant
-            sig_matrix[i, i] = 0
-        else:
-            shadows_i = shadows_by_idx[data['ketQ_idx']]
-            HQsparse = get_sparse_operator(HQ)
-            HQ_dense = HQsparse.toarray()
+    start_time = time.time()
+    with mp.Pool(processes=NUM_WORKERS) as pool:
+        diag_results = pool.map(_estimate_diag_worker, diag_args)
+    elapsed = time.time() - start_time
 
-            h_ii = estimator.estimate_linear(shadows_i, HQ_dense)
-            sig_ii = shadow_sampling_cost_diagonal(NQ, NUM_SHADOWS)
-            Hsub[i, i] = h_ii
-            sig_matrix[i, i] = sig_ii
+    # Fill diagonal results into matrices
+    for i, h_ii, sig_ii in diag_results:
+        Hsub[i, i] = h_ii
+        sig_matrix[i, i] = sig_ii
 
-    # Off-diagonal elements
-    print("  Estimating off-diagonal elements (parallel)...")
+    print(f"    Completed {Nstates} diagonal estimations in {elapsed:.1f}s")
+
+    # Off-diagonal elements using |0⟩±|ψ⟩ superposition approach (parallel)
+    # Uses the formula: H_ij = 2 * (Tr(ρ_i^+ ρ_j^+ H) + Tr(ρ_i^- ρ_j^- H))
+    # where ρ_i^± are density matrices for (|0⟩ ± |ψ_i⟩)/√2
+    print("  Estimating off-diagonal elements via |0⟩±|ψ⟩ superposition (parallel)...")
     ij_pairs = [(i, j) for i in range(Nstates) for j in range(Nstates) if i > j]
     total_pairs = len(ij_pairs)
 
-    # Prepare arguments for parallel processing - include full pipeline data
+    # Prepare arguments for parallel processing with ± superposition shadows
     offdiag_args = []
     for i, j in ij_pairs:
-        print(f"    Preparing off-diagonal pair ({i}, {j})...")
-        data = precomputed_data[(i, j)]
-        bra_f = factorized_tapered_statevectors[i]
-        ket_f = factorized_tapered_statevectors[j]
-        bra_labels = UCSF_information[i][0]
-        ket_labels = UCSF_information[j][0]
-        bra_config = data['bra_config']
-        ket_config = data['ket_config']
-
         offdiag_args.append((
-            i, j, bra_f, ket_f, bra_labels, ket_labels, bra_config, ket_config,
-            Hqub, Nqubits, shadows_by_idx, precomputed_data, NUM_SHADOWS
+            i, j, shadows_plus_by_idx, shadows_minus_by_idx, precomputed_data, NUM_SHADOWS, HQ_cache
         ))
 
     print(f"    Processing {total_pairs} off-diagonal pairs...")
 
-    # Parallel off-diagonal estimation (full pipeline)
+    # Parallel off-diagonal estimation using |0⟩±|ψ⟩ superposition approach
     start_time = time.time()
     with mp.Pool(processes=NUM_WORKERS) as pool:
-        offdiag_results = pool.map(_estimate_offdiag_worker, offdiag_args)
+        offdiag_results = pool.map(_estimate_offdiag_worker_zero_superposition, offdiag_args)
     elapsed = time.time() - start_time
 
     # Fill results into matrices
@@ -537,15 +677,18 @@ def main():
             Hsub_exact[i, i] = HQ.constant
         else:
             HQsparse = get_sparse_operator(HQ)
-            ketQ_sparse = convert_dense_format_to_sparse_format(ketQ)
+            # Normalize ketQ for consistency with shadow tomography
+            ketQ_norm = ketQ / np.linalg.norm(ketQ)
+            ketQ_sparse = convert_dense_format_to_sparse_format(ketQ_norm)
             Hsub_exact[i, i] = (ketQ_sparse @ HQsparse @ ketQ_sparse.T)[0, 0]
 
     # Exact off-diagonal elements
+    # NOTE: We do NOT apply the ij_shift here to match the shadow tomography estimation
+    # which uses the unshifted Hamiltonian. The shift was originally used for numerical
+    # conditioning but affects the result after tapering/projection.
     for i in range(Nstates):
         for j in range(Nstates):
             if i > j:
-                ij_shift = 0.5 * (Hsub_exact[i, i] + Hsub_exact[j, j])
-
                 bra_f = factorized_tapered_statevectors[i]
                 bra_labels = UCSF_information[i][0]
                 bra_config = configs[i]
@@ -554,15 +697,19 @@ def main():
                 ket_labels = UCSF_information[j][0]
                 ket_config = configs[j]
 
-                Htapered = project_out_seniority_symmetries(Hqub - ij_shift, Nqubits, bra_config, ket_config)
+                # Use unshifted Hamiltonian to match shadow tomography
+                Htapered = project_out_seniority_symmetries(Hqub, Nqubits, bra_config, ket_config)
                 HQ, braQ, ketQ, NQ = evaluate_fully_classical_factors(bra_f, ket_f, bra_labels, ket_labels, Htapered)
 
                 if NQ == 0:
                     Hsub_exact[i, j] = HQ.constant
                 else:
                     HQsparse = get_sparse_operator(HQ, NQ)
-                    braQ_sparse = convert_dense_format_to_sparse_format(braQ)
-                    ketQ_sparse = convert_dense_format_to_sparse_format(ketQ)
+                    # Normalize states for consistency with shadow tomography
+                    braQ_norm = braQ / np.linalg.norm(braQ)
+                    ketQ_norm = ketQ / np.linalg.norm(ketQ)
+                    braQ_sparse = convert_dense_format_to_sparse_format(braQ_norm)
+                    ketQ_sparse = convert_dense_format_to_sparse_format(ketQ_norm)
                     Hsub_exact[i, j] = (braQ_sparse @ HQsparse @ ketQ_sparse.T)[0, 0]
 
                 Hsub_exact[j, i] = Hsub_exact[i, j]
@@ -570,6 +717,44 @@ def main():
     # Compute exact ground state energy
     vals_exact, vecs_exact = np.linalg.eigh(Hsub_exact)
     Egs_exact = vals_exact[0]
+
+    # =============================================================================
+    # DIAGNOSTIC: Check S_ij = ⟨ψ_i|ψ_j⟩ and ⟨0|H|0⟩ for the formula assumptions
+    # =============================================================================
+    print("\n--- Diagnostic: Checking formula assumptions ---")
+    for i in range(Nstates):
+        for j in range(Nstates):
+            if i > j:
+                data = precomputed_data[(i, j)]
+                if data['NQ'] > 0:
+                    braQ_idx = data['braQ_idx']
+                    ketQ_idx = data['ketQ_idx']
+
+                    # Get the quantum state vectors
+                    braQ = state_index_to_key[braQ_idx][1]
+                    ketQ = state_index_to_key[ketQ_idx][1]
+
+                    # Normalize for overlap computation
+                    braQ_norm = braQ / np.linalg.norm(braQ)
+                    ketQ_norm = ketQ / np.linalg.norm(ketQ)
+
+                    # Compute overlap S_ij = ⟨ψ_i|ψ_j⟩
+                    S_ij = np.vdot(braQ_norm, ketQ_norm)
+
+                    # Compute ⟨0|H|0⟩
+                    HQ, NQ = HQ_cache[(i, j)]
+                    HQsparse = get_sparse_operator(HQ, NQ)
+                    HQ_dense = HQsparse.toarray()
+                    H_00 = HQ_dense[0, 0].real  # ⟨0|H|0⟩
+
+                    # Compute ⟨0|ψ_i⟩ and ⟨0|ψ_j⟩
+                    dim = len(braQ_norm)
+                    zero_state = np.zeros(dim)
+                    zero_state[0] = 1.0
+                    overlap_0_bra = np.vdot(zero_state, braQ_norm)
+                    overlap_0_ket = np.vdot(zero_state, ketQ_norm)
+
+                    print(f"  ({i},{j}): S_ij = {S_ij:.6f}, ⟨0|H|0⟩ = {H_00:.6f}, ⟨0|ψ_i⟩ = {overlap_0_bra:.6f}, ⟨0|ψ_j⟩ = {overlap_0_ket:.6f}")
 
     # Compute shadow tomography results
     vals, vecs = np.linalg.eigh(Hsub)

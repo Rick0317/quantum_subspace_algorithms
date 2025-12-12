@@ -113,12 +113,12 @@ class ShadowEstimator:
                          use_median_of_means: bool = False,
                          num_groups: int = 10) -> float:
         """
-        Estimate Tr(rho_i * O * rho_j) from classical shadows
+        Estimate Tr(rho_i * O * rho_j) from classical shadows (VECTORIZED)
 
         This computes <psi_i|O|psi_j> = Tr(|psi_i><psi_i| O |psi_j><psi_j|)
         which equals Tr(rho_i @ O @ rho_j) using the cyclic property of trace.
 
-        Uses median-of-means for variance reduction when enabled.
+        Uses vectorized numpy operations for significant speedup.
 
         Args:
             shadows_i: Classical shadows for state i
@@ -133,15 +133,34 @@ class ShadowEstimator:
         n_i = len(shadows_i)
         n_j = len(shadows_j)
 
+        # Stack shadows into 3D arrays: (num_shadows, dim, dim)
+        shadows_i_stack = np.stack(shadows_i)  # (n_i, d, d)
+        shadows_j_stack = np.stack(shadows_j)  # (n_j, d, d)
+
         if not use_median_of_means or n_i < num_groups or n_j < num_groups:
-            # Simple mean estimator
-            total = 0.0
-            for shadow_i in shadows_i:
-                for shadow_j in shadows_j:
-                    total += np.trace(shadow_i @ observable @ shadow_j).real
+            # Vectorized mean estimator
+            # We want: sum_n sum_m Tr(shadow_i[n] @ O @ shadow_j[m])
+            #
+            # Tr(A @ B @ C) = sum_ijk A_ij * B_jk * C_ki
+            # For batched computation over all (n,m) pairs:
+            #   Tr(shadow_i[n] @ O @ shadow_j[m]) = sum_ijk shadow_i[n,i,j] * O[j,k] * shadow_j[m,k,i]
+            #
+            # Step 1: Compute O @ shadow_j for all m: result[m,j,i] = sum_k O[j,k] * shadow_j[m,k,i]
+            # Step 2: Compute Tr(shadow_i @ result) for all (n,m) pairs
+
+            # Compute O @ shadow_j for all j: (n_j, d, d)
+            # O[j,k] @ shadow_j[m,k,l] -> result[m,j,l]
+            O_shadows_j = np.einsum('jk,mkl->mjl', observable, shadows_j_stack)  # (n_j, d, d)
+
+            # Compute Tr(shadow_i @ O_shadow_j) for all pairs
+            # Tr(A @ B) = sum_ij A[i,j] * B[j,i]
+            # For batched: sum_ij shadow_i[n,i,j] * O_shadows_j[m,j,i]
+            trace_matrix = np.einsum('nij,mji->nm', shadows_i_stack, O_shadows_j)  # (n_i, n_j)
+
+            total = np.sum(trace_matrix).real
             return total / (n_i * n_j)
 
-        # Median of means: split into groups, compute mean of each, take median
+        # Median of means with vectorized group computation
         group_size_i = n_i // num_groups
         group_size_j = n_j // num_groups
 
@@ -152,15 +171,16 @@ class ShadowEstimator:
             start_j = g * group_size_j
             end_j = start_j + group_size_j
 
-            group_total = 0.0
-            count = 0
-            for shadow_i in shadows_i[start_i:end_i]:
-                for shadow_j in shadows_j[start_j:end_j]:
-                    group_total += np.trace(shadow_i @ observable @ shadow_j).real
-                    count += 1
+            group_shadows_i = shadows_i_stack[start_i:end_i]  # (group_size_i, d, d)
+            group_shadows_j = shadows_j_stack[start_j:end_j]  # (group_size_j, d, d)
 
+            # Vectorized computation for this group
+            O_shadows_j = np.einsum('jk,mkl->mjl', observable, group_shadows_j)
+            trace_matrix = np.einsum('nij,mji->nm', group_shadows_i, O_shadows_j)
+
+            count = trace_matrix.size
             if count > 0:
-                group_means.append(group_total / count)
+                group_means.append(np.sum(trace_matrix).real / count)
 
         return float(np.median(group_means))
 
